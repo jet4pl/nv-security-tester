@@ -10,6 +10,7 @@ Framework testowy do weryfikacji skuteczności zabezpieczeń **NeuVector** w kla
 - [Pobranie repozytorium](#pobranie-repozytorium)
 - [Co testuje framework](#co-testuje-framework)
 - [Moduły testowe](#moduły-testowe)
+- [Budowanie obrazu (opcjonalne)](#budowanie-obrazu-opcjonalne)
 - [Uruchomienie testów](#uruchomienie-testów)
 - [Odczyt wyników](#odczyt-wyników)
 - [Statusy testów](#statusy-testów)
@@ -129,9 +130,52 @@ Weryfikuje konfigurację klastra pod kątem standardów **CIS Kubernetes Benchma
 
 ---
 
+## Budowanie obrazu (opcjonalne)
+
+Jeśli nie chcesz korzystać z gotowego obrazu z Docker Hub, możesz zbudować go samodzielnie lokalnie po pobraniu repozytorium.
+
+### Budowanie lokalne
+
+```bash
+docker build -t nv-security-tester:latest .
+```
+
+### Użycie własnego obrazu w klastrze
+
+W przypadku klastra bez dostępu do zewnętrznych registry (środowisko izolowane) załaduj obraz bezpośrednio na węzły RKE2 przez containerd:
+
+```bash
+# Eksport obrazu do pliku tar
+docker save nv-security-tester:latest -o nv-security-tester.tar
+
+# Import na każdym węźle RKE2
+scp nv-security-tester.tar <user>@<node-ip>:/tmp/
+ssh <user>@<node-ip> sudo ctr images import /tmp/nv-security-tester.tar
+```
+
+Następnie zaktualizuj nazwę obrazu w  — znajdź pole  w sekcji Job i zmień na własną nazwę:
+
+```yaml
+containers:
+  - name: tester
+    image: nv-security-tester:latest   # <- zmień na własną nazwę/tag
+    imagePullPolicy: IfNotPresent      # <- IfNotPresent wymusza użycie lokalnego obrazu
+```
+
+### Publikacja do własnego registry
+
+```bash
+docker tag nv-security-tester:latest <twoje-registry>/nv-security-tester:latest
+docker push <twoje-registry>/nv-security-tester:latest
+```
+
+Zaktualizuj pole  w  na adres swojego registry.
+
+---
+
 ## Uruchomienie testów
 
-### Krok 1 — Wdróż namespace, target app, RBAC i uruchom test
+### Krok 1 — Wdróż namespace, target app i RBAC
 
 ```bash
 kubectl apply -f k8s/manifests.yaml
@@ -185,7 +229,7 @@ kubectl cp neuvector-test/${POD}:/report/results.csv ./neuvector_results.csv
 
 Format CSV: `STATUS|MODULE|TEST|OPIS|TIMESTAMP`
 
-### Krok 2 Sprzątanie po testach
+### Krok 2 - Sprzątanie po testach
 
 ```bash
 kubectl delete namespace neuvector-test
@@ -247,5 +291,4 @@ Zmienne środowiskowe dostępne przez ConfigMap `nv-test-scripts` w `k8s/manifes
 
 ## Licencja
 
-GPL v3
-
+MIT
