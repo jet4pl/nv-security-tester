@@ -175,7 +175,7 @@ Zaktualizuj pole  w  na adres swojego registry.
 
 ## Uruchomienie testów
 
-### Krok 1 — Wdróż namespace, target app i RBAC
+### Krok 1 — Uruchom test
 
 ```bash
 kubectl apply -f k8s/manifests.yaml
