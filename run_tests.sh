@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # NeuVector Security Test Suite — Orchestrator
-# WAŻNE: celowo BEZ set -e i BEZ pipe między timeout a tee.
-# NeuVector w trybie Protect może wysłać SIGKILL (exit 137) do podprocesów.
-# Każdy moduł jest izolowany w osobnej podpowłoce — orchestrator zawsze
-# kontynuuje niezależnie od wyniku modułu.
+# Bez jq, bez pipe — kompatybilny z NeuVector tryb Protect
 # =============================================================================
 set -uo pipefail
 
@@ -15,7 +12,7 @@ source "${SCRIPT_DIR}/lib/results.sh"
 export NAMESPACE="${NAMESPACE:-neuvector-test}"
 export TARGET_SVC="${TARGET_SVC:-target-app}"
 export REPORT_DIR="/report"
-export RESULTS_FILE="${REPORT_DIR}/results.json"
+export RESULTS_FILE="${REPORT_DIR}/results.csv"
 export TEST_TIMEOUT="${TEST_TIMEOUT:-90}"
 export LOG_FILE="${REPORT_DIR}/run.log"
 
@@ -44,15 +41,10 @@ log_banner "NeuVector Security Test Suite"
 log_info "Namespace  : ${NAMESPACE}"
 log_info "Target SVC : ${TARGET_SVC}"
 log_info "Timeout    : ${TEST_TIMEOUT}s per moduł"
-log_info "Wyniki     : ${RESULTS_FILE}"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Pętla testowa
-# Kluczowe: NIE używamy pipe (cmd | tee) — zamiast tego:
-#   1. Uruchom moduł z przekierowaniem do pliku tymczasowego
-#   2. cat pliku po zakończeniu
-# Dzięki temu SIGKILL z NeuVector nie propaguje się do orchestratora.
+# Pętla testowa — redirect zamiast pipe, podpowłoka absorbuje SIGKILL
 # ---------------------------------------------------------------------------
 for i in "${!TESTS[@]}"; do
   TEST_ID="${TESTS[$i]}"
@@ -66,70 +58,90 @@ for i in "${!TESTS[@]}"; do
     continue
   fi
 
-  # Plik tymczasowy na output modułu — unikamy pipe
-  # Używamy /report zamiast /tmp — /tmp może być niedostępny w Alpine/NeuVector
   MODULE_LOG="${REPORT_DIR}/module_${TEST_ID}.log"
   EXIT_CODE=0
 
-  # Podpowłoka + timeout + przekierowanie do pliku (nie pipe!)
-  # Podpowłoka () sprawia że nawet jeśli timeout zostanie SIGKILL'd,
-  # orchestrator to przeżyje i złapie exit code przez || EXIT_CODE=$?
-  (
-    timeout "${TEST_TIMEOUT}" bash "${TEST_SCRIPT}"
-  ) > "${MODULE_LOG}" 2>&1 || EXIT_CODE=$?
+  ( timeout "${TEST_TIMEOUT}" bash "${TEST_SCRIPT}" ) > "${MODULE_LOG}" 2>&1 || EXIT_CODE=$?
 
-  # Wyświetl i zapisz output modułu
   cat "${MODULE_LOG}"
   cat "${MODULE_LOG}" >> "${LOG_FILE}" 2>/dev/null || true
-  rm -f "${MODULE_LOG}"
 
-  # Obsługa wszystkich możliwych exit code'ów
   case ${EXIT_CODE} in
-    0)
-      log_ok "Moduł ${TEST_LABEL}: zakończony pomyślnie"
-      ;;
-    124)
-      log_warn "Moduł ${TEST_LABEL}: TIMEOUT (>${TEST_TIMEOUT}s) — kontynuuję"
-      result_add "${RESULTS_FILE}" "${TEST_LABEL}" "Moduł-TIMEOUT" "TIMEOUT" \
-        "Cały moduł przekroczył timeout ${TEST_TIMEOUT}s" ""
-      ;;
-    137)
-      # SIGKILL — NeuVector zabił cały skrypt modułu, nie tylko podproces
-      log_warn "Moduł ${TEST_LABEL}: SIGKILL od NeuVector (kod 137) — kontynuuję"
-      result_add "${RESULTS_FILE}" "${TEST_LABEL}" "Moduł-SIGKILL" "BLOCKED" \
-        "NeuVector wysłał SIGKILL do całego skryptu modułu (kod 137) — wszystkie testy w module zablokowane" \
-        "Zrestartuj moduł z mniejszym TEST_TIMEOUT lub w trybie Monitor"
-      ;;
-    *)
-      log_warn "Moduł ${TEST_LABEL}: zakończony z kodem ${EXIT_CODE} — kontynuuję"
-      ;;
+    0)   log_ok  "Moduł ${TEST_LABEL}: zakończony" ;;
+    124) log_warn "Moduł ${TEST_LABEL}: TIMEOUT"
+         result_add "${RESULTS_FILE}" "${TEST_LABEL}" "Moduł-TIMEOUT" "TIMEOUT" \
+           "Cały moduł przekroczył timeout ${TEST_TIMEOUT}s" ;;
+    137) log_warn "Moduł ${TEST_LABEL}: SIGKILL (kod 137) — NeuVector zablokował moduł"
+         result_add "${RESULTS_FILE}" "${TEST_LABEL}" "Moduł-SIGKILL" "BLOCKED" \
+           "NeuVector SIGKILL na cały skrypt modułu" ;;
+    *)   log_warn "Moduł ${TEST_LABEL}: kod ${EXIT_CODE}" ;;
   esac
 
   echo ""
 done
 
+results_finalize "${RESULTS_FILE}"
+
 # ---------------------------------------------------------------------------
-# Podsumowanie i raport
+# Liczenie wyników — czysty bash/grep, zero jq
 # ---------------------------------------------------------------------------
-BLOCKED=$(jq '[.tests[] | select(.status=="BLOCKED")] | length' "${RESULTS_FILE}")
-PASSED=$(jq  '[.tests[] | select(.status=="PASS")]    | length' "${RESULTS_FILE}")
-FAILED=$(jq  '[.tests[] | select(.status=="FAIL")]    | length' "${RESULTS_FILE}")
-TIMEOUT_COUNT=$(jq '[.tests[] | select(.status=="TIMEOUT")] | length' "${RESULTS_FILE}")
-TOTAL_TESTS=$(jq '.tests | length' "${RESULTS_FILE}")
+BLOCKED=$(count_status "${RESULTS_FILE}" "BLOCKED")
+PASSED=$(count_status  "${RESULTS_FILE}" "PASS")
+FAILED=$(count_status  "${RESULTS_FILE}" "FAIL")
+TIMEOUT_COUNT=$(count_status "${RESULTS_FILE}" "TIMEOUT")
+TOTAL_TESTS=$(count_total "${RESULTS_FILE}")
 
-results_finalize "${RESULTS_FILE}" "${TOTAL_TESTS}" "${PASSED}" "${BLOCKED}" "${FAILED}" "${TIMEOUT_COUNT}"
+STARTED=$(grep "^# started_at=" "${RESULTS_FILE}" | cut -d= -f2)
+FINISHED=$(grep "^# finished_at=" "${RESULTS_FILE}" | cut -d= -f2)
 
-log_banner "PODSUMOWANIE"
-log_info "Łącznie testów  : ${TOTAL_TESTS}"
-log_ok   "PASS (atak nie zablokowany) : ${PASSED}"
-log_warn "BLOCKED (NeuVector block)   : ${BLOCKED}"
-log_fail "FAIL (błąd środowiska)      : ${FAILED}"
-log_warn "TIMEOUT                     : ${TIMEOUT_COUNT}"
+# ---------------------------------------------------------------------------
+# Raport Markdown wyświetlany w konsoli (kopiowalny)
+# ---------------------------------------------------------------------------
+cat << MDEOF
 
-log_info "Generowanie raportu HTML..."
-bash "${SCRIPT_DIR}/report/generate_report.sh" "${RESULTS_FILE}" "${REPORT_DIR}/report.html"
-log_ok "Raport gotowy: ${REPORT_DIR}/report.html"
-log_info ""
-log_info "Pobierz raport:"
-log_info "  POD=\$(kubectl get pod -n ${NAMESPACE} -l app=nv-security-tester -o jsonpath='{.items[0].metadata.name}')"
-log_info "  kubectl cp ${NAMESPACE}/\${POD}:${REPORT_DIR}/report.html ./raport_neuvector.html"
+$(printf '=%.0s' {1..60})
+# NEUVECTOR SECURITY TEST REPORT
+$(printf '=%.0s' {1..60})
+
+**Suite:** NeuVector Security Test Suite
+**Namespace:** ${NAMESPACE}
+**Start:** ${STARTED}
+**Koniec:** ${FINISHED}
+**Tryb NeuVector:** Protect
+
+## Podsumowanie
+
+| Status   | Liczba | Znaczenie                            |
+|----------|--------|--------------------------------------|
+| BLOCKED  | ${BLOCKED}      | Ataki zablokowane przez NeuVector    |
+| PASS     | ${PASSED}      | Ataki niezablokowane / testy bazowe  |
+| FAIL     | ${FAILED}      | Błąd środowiskowy testu              |
+| TIMEOUT  | ${TIMEOUT_COUNT}      | Przekroczono limit czasu             |
+| **ŁĄCZNIE** | **${TOTAL_TESTS}** |                                  |
+
+## Wyniki per test
+
+| Status | Moduł | Test | Opis | Czas |
+|--------|-------|------|------|------|
+MDEOF
+
+# Wiersze tabeli z CSV
+while IFS='|' read -r status module name desc ts; do
+  [[ "${status}" == "STATUS" ]] && continue
+  [[ "${status}" == \#* ]]      && continue
+  printf "| %-8s | %-25s | %-35s | %-55s | %s |\n" \
+    "${status}" "${module}" "${name}" "${desc}" "${ts}"
+done < <(grep -v "^#" "${RESULTS_FILE}")
+
+cat << MDEOF2
+
+$(printf '=%.0s' {1..60})
+
+> Raport wygenerowany: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+> Skopiuj powyższy tekst lub pobierz plik CSV:
+>   kubectl cp \${POD}:/report/results.csv ./neuvector_results.csv
+
+$(printf '=%.0s' {1..60})
+MDEOF2
+
+log_ok "Test suite zakończony."
