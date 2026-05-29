@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# tests/04_runtime_process.sh
-# Testuje Runtime Process Security NeuVector — uruchamia niedozwolone procesy
-# w kontenerze i sprawdza czy NeuVector je blokuje.
+# tests/04_runtime_process.sh — Runtime Process Security
+# NeuVector w trybie Protect może SIGKILL procesy exec w kontenerze.
+# Każdy test w izolowanej podpowłoce — kod 137 = BLOCKED.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,100 +12,87 @@ MODULE="Runtime Process"
 NS="${NAMESPACE:-neuvector-test}"
 RESULTS_FILE="${SCRIPT_DIR}/report/results.json"
 
-# Funkcja: exec polecenia w istniejącym podzie target-app lub tymczasowym
-exec_in_target() {
-  local cmd="$1"
-  local TARGET_POD
-  TARGET_POD=$(kubectl get pod -n "${NS}" -l app=target-app \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+# ---------------------------------------------------------------------------
+# Pomocnik: exec polecenia w tymczasowym Pod'zie, izolowany
+# exit 137 = SIGKILL od NeuVector = BLOCKED
+# ---------------------------------------------------------------------------
+rt_test() {
+  local test_id="$1"
+  local test_name="$2"
+  local cmd="$3"
+  local pod_suffix
+  pod_suffix="nv-rt-$(echo "${test_id}" | tr '[:upper:]' '[:lower:]' | tr -d '-')-$$"
 
-  if [[ -n "${TARGET_POD}" ]]; then
-    kubectl exec -n "${NS}" "${TARGET_POD}" -- sh -c "${cmd}" 2>&1
+  local output exit_code
+  exit_code=0
+
+  # Podpowłoka izoluje SIGKILL
+  output=$(
+    (
+      kubectl run "${pod_suffix}" \
+        --namespace="${NS}" \
+        --image=alpine:latest \
+        --restart=Never \
+        --rm \
+        --timeout=25s \
+        -- sh -c "${cmd}" 2>&1
+    )
+  ) || exit_code=$?
+
+  # Cleanup
+  kubectl delete pod "${pod_suffix}" -n "${NS}" \
+    --ignore-not-found --grace-period=0 >/dev/null 2>&1 &
+
+  local status desc
+  if [[ ${exit_code} -eq 137 ]]; then
+    status="BLOCKED"
+    desc="NeuVector wysłał SIGKILL (kod 137) — proces zablokowany agresywnie przez Runtime Policy"
+  elif [[ ${exit_code} -ne 0 ]] \
+    || echo "${output}" | grep -qi "permission denied\|operation not permitted\|blocked\|killed"; then
+    status="BLOCKED"
+    desc="Operacja zablokowana (exit=${exit_code})"
   else
-    # Fallback: tymczasowy pod
-    kubectl run "nv-rt-temp-$$" \
-      --namespace="${NS}" \
-      --image=alpine:latest \
-      --restart=Never \
-      --rm \
-      --timeout=20s \
-      -- sh -c "${cmd}" 2>&1
+    status="PASS"
+    desc="Operacja NIE zablokowana — weryfikuj Process Profile"
   fi
+
+  result_add "${RESULTS_FILE}" "${MODULE}" "${test_id} ${test_name}" "${status}" \
+    "${desc}" "${output:0:200}"
 }
 
 # ---------------------------------------------------------------------------
-# TEST RT-01: Uruchomienie niedozwolonego procesu (netcat)
+# RT-01: netcat
 # ---------------------------------------------------------------------------
-log_info "RT-01: Próba uruchomienia netcat (nc) w kontenerze"
-EXIT_CODE=0
-OUTPUT=$(exec_in_target "nc -z localhost 80 2>&1; echo exit_code:\$?") || EXIT_CODE=$?
-
-if [[ ${EXIT_CODE} -ne 0 ]] || echo "${OUTPUT}" | grep -qi "blocked\|killed\|permission denied\|not found\|operation not permitted"; then
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-01 Netcat (nc)" "BLOCKED" \
-    "Uruchomienie netcat zablokowane przez NeuVector Process Profile" "${OUTPUT:0:300}"
-else
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-01 Netcat (nc)" "PASS" \
-    "Netcat uruchomiony bez blokady — brak reguły process profile dla nc" "${OUTPUT:0:300}"
-fi
+log_info "RT-01: Uruchomienie netcat w kontenerze"
+rt_test "RT-01" "Netcat (nc)" \
+  "which nc && nc -z localhost 80; echo done"
 
 # ---------------------------------------------------------------------------
-# TEST RT-02: Odczyt /etc/shadow (privilege escalation attempt)
+# RT-02: /etc/shadow
 # ---------------------------------------------------------------------------
-log_info "RT-02: Próba odczytu /etc/shadow"
-EXIT_CODE=0
-OUTPUT=$(exec_in_target "cat /etc/shadow 2>&1") || EXIT_CODE=$?
-
-if [[ ${EXIT_CODE} -ne 0 ]] || echo "${OUTPUT}" | grep -qi "permission denied\|blocked\|no such file"; then
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-02 Odczyt /etc/shadow" "BLOCKED" \
-    "Dostęp do /etc/shadow zablokowany (permission denied lub NV block)" "${OUTPUT:0:300}"
-else
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-02 Odczyt /etc/shadow" "PASS" \
-    "/etc/shadow odczytany — kontener działa jako root bez ograniczeń" "${OUTPUT:0:300}"
-fi
+log_info "RT-02: Odczyt /etc/shadow"
+rt_test "RT-02" "Odczyt /etc/shadow" \
+  "cat /etc/shadow 2>&1 | head -3"
 
 # ---------------------------------------------------------------------------
-# TEST RT-03: Uruchomienie curl/wget w kontenerze (exfiltration tool)
+# RT-03: wget zewnętrzny
 # ---------------------------------------------------------------------------
-log_info "RT-03: Próba uruchomienia wget do zewnętrznego hosta"
-EXIT_CODE=0
-OUTPUT=$(exec_in_target "wget -q --timeout=5 -O /dev/null http://example.com 2>&1") || EXIT_CODE=$?
-
-if [[ ${EXIT_CODE} -ne 0 ]] || echo "${OUTPUT}" | grep -qi "blocked\|killed\|permission denied\|network unreachable\|timed out"; then
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-03 wget do zewnętrznego hosta" "BLOCKED" \
-    "wget zablokowany — reguła process profile lub network policy egress" "${OUTPUT:0:300}"
-else
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-03 wget do zewnętrznego hosta" "PASS" \
-    "wget do zewnętrznego hosta wykonany bez blokady" "${OUTPUT:0:300}"
-fi
+log_info "RT-03: wget do zewnętrznego hosta"
+rt_test "RT-03" "wget do zewnętrznego hosta" \
+  "wget -q --timeout=5 -O /dev/null http://example.com 2>&1; echo exit:\$?"
 
 # ---------------------------------------------------------------------------
-# TEST RT-04: Próba zapisu do /proc (kernel exploit attempt)
+# RT-04: zapis do /proc/sys
 # ---------------------------------------------------------------------------
-log_info "RT-04: Próba zapisu do /proc/sys/kernel"
-EXIT_CODE=0
-OUTPUT=$(exec_in_target "echo 0 > /proc/sys/kernel/dmesg_restrict 2>&1") || EXIT_CODE=$?
-
-if [[ ${EXIT_CODE} -ne 0 ]] || echo "${OUTPUT}" | grep -qi "permission denied\|read-only\|operation not permitted\|blocked"; then
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-04 Zapis do /proc/sys/kernel" "BLOCKED" \
-    "Próba modyfikacji /proc/sys zablokowana (seccomp/NV/kernel)" "${OUTPUT:0:300}"
-else
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-04 Zapis do /proc/sys/kernel" "PASS" \
-    "Zapis do /proc/sys/kernel dozwolony — brak ograniczeń seccomp" "${OUTPUT:0:300}"
-fi
+log_info "RT-04: Zapis do /proc/sys/kernel"
+rt_test "RT-04" "Zapis /proc/sys/kernel" \
+  "echo 0 > /proc/sys/kernel/dmesg_restrict 2>&1; echo exit:\$?"
 
 # ---------------------------------------------------------------------------
-# TEST RT-05: Uruchomienie bash z SUID (privilege escalation)
+# RT-05: SUID na /bin/sh
 # ---------------------------------------------------------------------------
-log_info "RT-05: Próba uruchomienia bash jako SUID"
-EXIT_CODE=0
-OUTPUT=$(exec_in_target "chmod u+s /bin/sh 2>&1; ls -la /bin/sh 2>&1") || EXIT_CODE=$?
-
-if [[ ${EXIT_CODE} -ne 0 ]] || echo "${OUTPUT}" | grep -qi "permission denied\|operation not permitted\|blocked"; then
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-05 Ustawienie SUID na /bin/sh" "BLOCKED" \
-    "Ustawienie bitu SUID zablokowane przez NeuVector lub kernel" "${OUTPUT:0:300}"
-else
-  result_add "${RESULTS_FILE}" "${MODULE}" "RT-05 Ustawienie SUID na /bin/sh" "PASS" \
-    "Bit SUID ustawiony bez blokady — kontener ma zbyt szerokie uprawnienia" "${OUTPUT:0:300}"
-fi
+log_info "RT-05: chmod SUID na /bin/sh"
+rt_test "RT-05" "Ustawienie SUID /bin/sh" \
+  "chmod u+s /bin/sh 2>&1; ls -la /bin/sh"
 
 log_ok "Moduł Runtime Process Security zakończony"

@@ -1,10 +1,8 @@
 # Dockerfile — NeuVector Security Tester
-# Obraz zawiera wszystkie narzędzia potrzebne do testów:
-# bash, curl, kubectl, jq, bc
-
+# WAŻNE: chmod +x na wszystkich skryptach jest wykonywany tutaj podczas budowania
+# obrazu. NeuVector w trybie Protect blokuje chmod w runtime.
 FROM alpine:3.19
 
-# Instalacja narzędzi
 RUN apk add --no-cache \
       bash \
       curl \
@@ -15,7 +13,7 @@ RUN apk add --no-cache \
       ca-certificates \
       openssl
 
-# Instalacja kubectl
+# kubectl
 ARG KUBECTL_VERSION=v1.29.3
 RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
       -o /usr/local/bin/kubectl && \
@@ -23,20 +21,25 @@ RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kub
 
 WORKDIR /app
 
-# Kopiuj framework testowy
 COPY run_tests.sh        ./
 COPY lib/                ./lib/
 COPY tests/              ./tests/
 COPY report/             ./report/
 
-# Uprawnienia wykonywania
-RUN chmod +x run_tests.sh \
-      lib/*.sh \
-      tests/*.sh \
-      report/generate_report.sh
+# KLUCZOWE: wszystkie uprawnienia ustawiane przy budowie obrazu
+# NeuVector blokuje chmod w trybie Protect
+RUN chmod +x \
+      /app/run_tests.sh \
+      /app/lib/logger.sh \
+      /app/lib/results.sh \
+      /app/tests/01_network_policy.sh \
+      /app/tests/02_dlp.sh \
+      /app/tests/03_waf.sh \
+      /app/tests/04_runtime_process.sh \
+      /app/tests/05_vulnerability_scan.sh \
+      /app/tests/06_compliance_cis.sh \
+      /app/report/generate_report.sh
 
-# Katalog na wyniki raportu
 RUN mkdir -p /report
 
-# Punkt wejścia
 ENTRYPOINT ["/bin/bash", "/app/run_tests.sh"]
