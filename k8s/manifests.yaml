@@ -178,7 +178,7 @@ spec:
       containers:
         - name: tester
           # Zastąp własną nazwą obrazu po docker build
-          image: nv-security-tester:latest
+          image: jet4pl/nv-security-tester:latest
           imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "/app/run_tests.sh"]
           envFrom:
