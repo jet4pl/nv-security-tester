@@ -291,4 +291,4 @@ Zmienne środowiskowe dostępne przez ConfigMap `nv-test-scripts` w `k8s/manifes
 
 ## Licencja
 
-MIT
+GPL v3
