@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Wymuszenie użycia Node 24 dla wszystkich akcji w tym pliku
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
 
   build:
